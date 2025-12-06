@@ -110,6 +110,8 @@ const App = () => {
           originY: match.boundingBox.originY + (newDet.boundingBox.originY - match.boundingBox.originY) * alpha,
           width: match.boundingBox.width + (newDet.boundingBox.width - match.boundingBox.width) * alpha,
           height: match.boundingBox.height + (newDet.boundingBox.height - match.boundingBox.height) * alpha,
+          angle: match.boundingBox.angle ?? 0,
+          // ---------------------------------
         };
         smoothedDetections.push({ ...newDet, boundingBox: box });
       } else {
