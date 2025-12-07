@@ -24,7 +24,7 @@ const App = () => {
   const frameCountRef = useRef(0);
   const lastTimeRef = useRef(performance.now());
 
-  const CAMERA_URL = "/animals.mp4";
+  const CAMERA_URL = "/farmer.mp4";
 
   // OPTIMIZATSIYA: Har 3-kadrda deteksiya (30fps -> 10fps detection)
   const DETECTION_INTERVAL = 3;
