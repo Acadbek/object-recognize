@@ -281,7 +281,7 @@ const App = () => {
             fontSize: '16px',
             fontWeight: 'bold'
           }}>
-            🔄 Model yuklanmoqda...
+            AI yuklanmoqda...
           </div>
         )}
 
