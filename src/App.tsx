@@ -17,11 +17,17 @@ const App = () => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [modelLoaded, setModelLoaded] = useState(false);
+  const [fps, setFps] = useState(0);
   const objectDetectorRef = useRef<ObjectDetector | null>(null);
   const requestRef = useRef<number>();
   const lastDetectionsRef = useRef<Detection[]>([]);
+  const frameCountRef = useRef(0);
+  const lastTimeRef = useRef(performance.now());
 
-  const CAMERA_URL = "/farmer.mp4";
+  const CAMERA_URL = "/animals.mp4";
+
+  // OPTIMIZATSIYA: Har 3-kadrda deteksiya (30fps -> 10fps detection)
+  const DETECTION_INTERVAL = 3;
 
   const initializeModel = async () => {
     try {
@@ -31,21 +37,29 @@ const App = () => {
 
       const objectDetector = await ObjectDetector.createFromOptions(vision, {
         baseOptions: {
-          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite2/float32/1/efficientdet_lite2.tflite",
-          delegate: "GPU",
+          // OPTIMIZATSIYA 1: Yengil model
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite",
+          // OPTIMIZATSIYA 2: CPU rejimi (Telegram'da GPU ishlamasligi mumkin)
+          delegate: "CPU",
         },
-        scoreThreshold: 0.2,
+        // OPTIMIZATSIYA 3: Yuqoriroq threshold - kamroq deteksiya
+        scoreThreshold: 0.4,
+        // OPTIMIZATSIYA 4: Max results cheklash
+        maxResults: 5,
         runningMode: "VIDEO",
       });
 
       objectDetectorRef.current = objectDetector;
       setModelLoaded(true);
+      console.log("✅ Model yuklandi (Lite0, CPU mode)");
     } catch (error) {
-      console.error("error:", error);
+      console.error("❌ Model yuklashda xato:", error);
     }
   };
 
   const predictVideo = () => {
+    frameCountRef.current++;
+
     if (
       objectDetectorRef.current &&
       videoRef.current &&
@@ -61,90 +75,161 @@ const App = () => {
         return;
       }
 
+      // Canvas o'lchamini bir marta o'rnatish
       if (canvas.width !== video.videoWidth || canvas.height !== video.videoHeight) {
         canvas.width = video.videoWidth;
         canvas.height = video.videoHeight;
       }
 
-      let startTimeMs = performance.now();
+      // OPTIMIZATSIYA: Har N-kadrda deteksiya
+      if (frameCountRef.current % DETECTION_INTERVAL === 0) {
+        const startTimeMs = performance.now();
 
-      const rawDetections = objectDetectorRef.current.detectForVideo(
-        video,
-        startTimeMs
-      ).detections;
+        const rawDetections = objectDetectorRef.current.detectForVideo(
+          video,
+          startTimeMs
+        ).detections;
 
-      const finalDetections = smoothResults(rawDetections);
+        // OPTIMIZATSIYA: Kamroq interpolatsiya
+        const finalDetections = smoothResults(rawDetections, 0.3);
 
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          drawRect(finalDetections, ctx);
+        }
 
-      const ctx = canvas.getContext("2d");
-      if (ctx) {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-        drawRect(finalDetections, ctx);
+        // FPS hisoblash
+        updateFPS();
+      } else {
+        // Deteksiya bo'lmagan kadrlarda eski natijalarni chizish
+        const ctx = canvas.getContext("2d");
+        if (ctx) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          drawRect(lastDetectionsRef.current, ctx);
+        }
       }
     }
 
     requestRef.current = requestAnimationFrame(predictVideo);
   };
 
-  const smoothResults = (newDetections: Detection[]): Detection[] => {
+  // OPTIMIZATSIYA: Soddalashtirilgan smoothing
+  const smoothResults = (newDetections: Detection[], alpha: number = 0.3): Detection[] => {
+    if (lastDetectionsRef.current.length === 0) {
+      lastDetectionsRef.current = newDetections;
+      return newDetections;
+    }
+
     const smoothedDetections: Detection[] = [];
     const prevDetections = lastDetectionsRef.current;
+    const DISTANCE_THRESHOLD = 150;
 
-    const alpha = 0.2;
+    for (const newDet of newDetections) {
+      if (!newDet.boundingBox) continue;
 
-    newDetections.forEach((newDet) => {
-      if (!newDet.boundingBox) return;
+      let matched = false;
 
-      const match = prevDetections.find((prev) => {
-        if (!prev.boundingBox) return false;
-        const dx = prev.boundingBox.originX - newDet.boundingBox!.originX;
-        const dy = prev.boundingBox.originY - newDet.boundingBox!.originY;
-        const distance = Math.sqrt(dx * dx + dy * dy);
+      // Eng yaqin oldingi deteksiyani topish
+      for (const prev of prevDetections) {
+        if (!prev.boundingBox) continue;
 
-        return distance < 100 && prev.categories[0].categoryName === newDet.categories[0].categoryName;
-      });
+        // Kategoriya bir xilmi?
+        if (prev.categories[0]?.categoryName !== newDet.categories[0]?.categoryName) {
+          continue;
+        }
 
-      if (match && match.boundingBox) {
-        const box = {
-          originX: match.boundingBox.originX + (newDet.boundingBox.originX - match.boundingBox.originX) * alpha,
-          originY: match.boundingBox.originY + (newDet.boundingBox.originY - match.boundingBox.originY) * alpha,
-          width: match.boundingBox.width + (newDet.boundingBox.width - match.boundingBox.width) * alpha,
-          height: match.boundingBox.height + (newDet.boundingBox.height - match.boundingBox.height) * alpha,
-          angle: match.boundingBox.angle ?? 0,
-          // ---------------------------------
-        };
-        smoothedDetections.push({ ...newDet, boundingBox: box });
-      } else {
+        // Masofa hisoblash
+        const dx = prev.boundingBox.originX - newDet.boundingBox.originX;
+        const dy = prev.boundingBox.originY - newDet.boundingBox.originY;
+        const distanceSq = dx * dx + dy * dy;
+
+        if (distanceSq < DISTANCE_THRESHOLD * DISTANCE_THRESHOLD) {
+          // Interpolatsiya
+          const box = {
+            originX: prev.boundingBox.originX + (newDet.boundingBox.originX - prev.boundingBox.originX) * alpha,
+            originY: prev.boundingBox.originY + (newDet.boundingBox.originY - prev.boundingBox.originY) * alpha,
+            width: prev.boundingBox.width + (newDet.boundingBox.width - prev.boundingBox.width) * alpha,
+            height: prev.boundingBox.height + (newDet.boundingBox.height - prev.boundingBox.height) * alpha,
+            angle: 0,
+          };
+          smoothedDetections.push({ ...newDet, boundingBox: box });
+          matched = true;
+          break;
+        }
+      }
+
+      // Agar mos kelmasa, yangi deteksiya qo'shish
+      if (!matched) {
         smoothedDetections.push(newDet);
       }
-    });
+    }
 
     lastDetectionsRef.current = smoothedDetections;
     return smoothedDetections;
   };
 
+  const updateFPS = () => {
+    const now = performance.now();
+    const delta = now - lastTimeRef.current;
+
+    if (delta > 1000) {
+      const currentFps = Math.round((frameCountRef.current * 1000) / delta);
+      setFps(currentFps);
+      frameCountRef.current = 0;
+      lastTimeRef.current = now;
+    }
+  };
+
   useEffect(() => {
-    if (modelLoaded && videoRef.current) {
-      console.log("Detection boshlandi...");
+    if (modelLoaded && videoRef.current && !videoRef.current.paused) {
+      console.log("🎬 Deteksiya boshlandi");
       predictVideo();
     }
   }, [modelLoaded]);
 
   useEffect(() => {
-    if (window.Telegram && window.Telegram.WebApp) {
+    // Telegram WebApp integratsiyasi
+    if (window.Telegram?.WebApp) {
       window.Telegram.WebApp.ready();
       window.Telegram.WebApp.expand();
+      window.Telegram.WebApp.enableClosingConfirmation();
+      console.log("📱 Telegram WebApp tayyor");
     }
+
     initializeModel();
+
+    // Video autoplay
+    const video = videoRef.current;
+    if (video) {
+      video.muted = true;
+      video.defaultMuted = true;
+
+      const playPromise = video.play();
+      if (playPromise !== undefined) {
+        playPromise
+          .then(() => console.log("▶️ Video boshlandi"))
+          .catch((error) => {
+            console.warn("⚠️ Autoplay bloklandi:", error);
+            video.muted = true;
+            video.play().catch(console.error);
+          });
+      }
+    }
+
     return () => {
-      if (requestRef.current) cancelAnimationFrame(requestRef.current);
+      if (requestRef.current) {
+        cancelAnimationFrame(requestRef.current);
+      }
+      if (objectDetectorRef.current) {
+        objectDetectorRef.current.close();
+      }
     };
   }, []);
 
   return (
     <div className="wrapper">
-      <div className="container" style={{ position: 'relative', width: 'fit-content' }}>
-
+      <div className="container" style={{ position: 'relative', width: '100%', maxWidth: '100vw' }}>
         <video
           ref={videoRef}
           className="my-video"
@@ -152,6 +237,7 @@ const App = () => {
           autoPlay
           loop
           muted
+          playsInline
           crossOrigin="anonymous"
           onPlay={() => {
             if (modelLoaded && !requestRef.current) {
@@ -162,7 +248,8 @@ const App = () => {
             display: 'block',
             width: '100%',
             height: 'auto',
-            objectFit: 'cover'
+            maxHeight: '80vh',
+            objectFit: 'contain'
           }}
         />
 
@@ -175,16 +262,44 @@ const App = () => {
             left: 0,
             zIndex: 10,
             width: '100%',
-            height: 'auto',
+            height: '100%',
+            pointerEvents: 'none'
           }}
         />
 
         {!modelLoaded && (
           <div style={{
-            position: 'absolute', top: '50%', left: '50%', transform: 'translate(-50%, -50%)',
-            color: 'white', background: 'rgba(0,0,0,0.7)', padding: '10px', borderRadius: '5px', zIndex: 20
+            position: 'absolute',
+            top: '50%',
+            left: '50%',
+            transform: 'translate(-50%, -50%)',
+            color: 'white',
+            background: 'rgba(0,0,0,0.8)',
+            padding: '15px 25px',
+            borderRadius: '10px',
+            zIndex: 20,
+            fontSize: '16px',
+            fontWeight: 'bold'
           }}>
-            Model yuklanmoqda...
+            🔄 Model yuklanmoqda...
+          </div>
+        )}
+
+        {/* FPS ko'rsatkich */}
+        {modelLoaded && (
+          <div style={{
+            position: 'absolute',
+            top: '10px',
+            right: '10px',
+            color: 'white',
+            background: 'rgba(0,0,0,0.7)',
+            padding: '5px 10px',
+            borderRadius: '5px',
+            zIndex: 20,
+            fontSize: '12px',
+            fontFamily: 'monospace'
+          }}>
+            FPS: {fps}
           </div>
         )}
       </div>
